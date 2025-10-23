@@ -32,6 +32,19 @@ enum class PacketStatus {
     TIMED_OUT,
     RESP_ERROR
 };
+enum class TypeRequest{
+    NONE,
+    TYPE3=3,
+    TYPE11=11,
+    TYPE12=12,
+    TYPE5=5
+};
+enum class TypeCodes{
+    NONE,
+    CODE0,
+    CODE1,
+    CODE3=3
+};
 struct PacketData {
     int id{-1}; //для сравнения с кол-вом пакетов
     PacketStatus status = PacketStatus::NSEND;
@@ -59,6 +72,7 @@ struct ICMPhdr {
     uint32_t data;
 };
 #pragma pack(pop)
+
 //methods
 uint16_t icmp_checksum(const void *data, size_t len) {
     const uint8_t *bytes = reinterpret_cast<const uint8_t*>(data);
@@ -116,6 +130,10 @@ vector<char> packetForm(){
     printf("payload=%08X ", icmphdr.data);
     return sendBuffer;
 }
+std::pair<TypeRequest, TypeCodes> parse_of_request(const std::vector<char>& request, size_t size, vector<char>::iterator iterator);
+pair <TypeRequest, string> status_of_err(TypeRequest type, TypeCodes code);
+bool is_error (TypeRequest type);
+
 string status_to_string(PacketStatus s) {
     switch (s) {
     case PacketStatus::NSEND:      return "NSEND";
@@ -189,7 +207,8 @@ int main()
     DWORD nonBlocking = 1;
     if ( ioctlsocket( sock, FIONBIO, &nonBlocking ) != 0 )
     {
-        cout << "failed to set non-blocking socket\n" << endl;
+        int error_code = WSAGetLastError();
+        cerr << "nonblocking socket failed with error: " << error_code << endl;
         closesocket(sock);
         WSACleanup();
         return 1;
@@ -204,10 +223,13 @@ int main()
     struct sockaddr_in sender_addr;
     socklen_t sender_addr_len = sizeof(sender_addr);
     fd_set readfs;
+
     vector<char> recvBuffer(1500);
-    auto next_send = std::chrono::steady_clock::now();
     vector<char> sendBuffer;
     vector<PacketData> packets;
+
+    auto next_send = std::chrono::steady_clock::now();
+
     int countPacket = 4;
     int currPacket = 0;
     while (true) {
@@ -232,8 +254,6 @@ int main()
                     packetData.id = currPacket;
                     packetData.status = PacketStatus::SENT;
                     packetData.send_timestamp = chrono::steady_clock::now();
-
-                    // копируем 4 байта payload из отправленного буфера в packetData.guid
                     size_t data_off = offsetof(ICMPhdr, data);
                     packetData.guid.assign(
                         reinterpret_cast<uint8_t*>(sendBuffer.data() + data_off),
@@ -303,8 +323,9 @@ int main()
                         }
                     } else if (recv_flag > 0 ){
                         cout << "read packet " << currPacket << endl;
-                    auto recv_end = recvBuffer.begin() + recv_flag;
+
                         bool matched = false;
+                        auto recv_end = recvBuffer.begin() + recv_flag;
                         for (auto &pkt : packets) {
                             //парсинг ответов(поиск guid в строке ответа) и присвоение статуса "ответ получен"
                             if (pkt.status == PacketStatus::SENT) {
@@ -316,27 +337,25 @@ int main()
                                 cout << endl;
 
                                 cout << "In recvBuffer (hex): ";
+
                                 for (auto it = recvBuffer.begin(); it != recv_end; ++it) {
                                     cout << setw(2) << setfill('0') << hex << (int)(unsigned char)*it << " ";
                                 }
                                 cout << endl;
                                 auto it = search(
-                                    recvBuffer.begin(), recv_end,
+                                    recvBuffer.begin(), recvBuffer.end(),
                                     pkt.guid.begin(), pkt.guid.end(),
                                     [](char b1, uint8_t b2){ return static_cast<uint8_t>(b1) == b2; }
                                     );
-
-                                //if (it != recv_end) {
-                                //    pkt.receive_timestamp = chrono::steady_clock::now();
-                                //    pkt.status = PacketStatus::RESP_RECVD;
-                                //    auto dur_ms = chrono::duration_cast<milliseconds>(pkt.receive_timestamp - pkt.send_timestamp).count();
-                                //    cout << "\nMatched packet id: " << pkt.id << " duration: " <<dec<< dur_ms << " ms\n";
-                                //    matched = true;
-                                //    break;
-                                //}
                                 if (it != recvBuffer.end()) {
+                                    auto [recvType, recvCode] = parse_of_request(recvBuffer, recvBuffer.size(), it);
+                                    status_of_err(recvType, recvCode);
+                                    if (is_error(recvType) == true){
+                                        pkt.status = PacketStatus::RESP_ERROR;
+                                    }else{
+                                        pkt.status = PacketStatus::RESP_RECVD;
+                                    }
                                     pkt.receive_timestamp = chrono::steady_clock::now();
-                                    pkt.status = PacketStatus::RESP_RECVD;
                                     auto dur_ms = chrono::duration_cast<milliseconds>(pkt.receive_timestamp - pkt.send_timestamp).count();
                                     cout << "\nMatched packet id: " << pkt.id << " duration: " <<dec<< dur_ms << " ms\n";
                                     matched = true;
@@ -374,4 +393,60 @@ int main()
     closesocket(sock);
     WSACleanup();
     return 0;
+}
+
+bool is_error (TypeRequest type){
+    if (type == TypeRequest::TYPE3      ||
+        type == TypeRequest::TYPE11     ||
+        type == TypeRequest::TYPE12     ||
+        type == TypeRequest::TYPE5){
+        return true;
+    } else return false;
+}
+pair <TypeRequest, string> status_of_err(TypeRequest type, TypeCodes code) {
+    switch (type) {
+    case TypeRequest::TYPE3: {
+        switch (code) {
+        case TypeCodes::CODE0:  return make_pair(TypeRequest::TYPE3, "Destination Unreachable. The network is unreachable.") ;
+        case TypeCodes::CODE1:  return make_pair(TypeRequest::TYPE3, "Destination Unreachable. The host is unreachable.");
+        case TypeCodes::CODE3:  return make_pair(TypeRequest::TYPE3, "Destination Unreachable. The port is unreachable.");
+        default: return make_pair(TypeRequest::TYPE3, "UNKNOWN CODE for TYPE3");
+        }
+    }
+    case TypeRequest::TYPE11: {
+        switch (code) {
+        case TypeCodes::CODE0:  return make_pair(TypeRequest::TYPE11, "Time Exceeded. Transit lifetime exceeded.");
+        case TypeCodes::CODE1:  return make_pair(TypeRequest::TYPE11, "Time Exceeded. Time exceeded while assembling fragments.");
+        default: return make_pair(TypeRequest::TYPE11, "UNKNOWN CODE for TYPE11");
+        }
+    }
+    case TypeRequest::TYPE12: {
+        switch (code){
+        case TypeCodes::CODE0:  return make_pair(TypeRequest::TYPE12, "Parameter Problem. The pointer points to an error.");
+        default: return make_pair(TypeRequest::TYPE12, "UNKNOWN CODE for TYPE12");
+        }
+    }
+
+    case TypeRequest::TYPE5: {
+        switch (code){
+        case TypeCodes::CODE0:  return make_pair(TypeRequest::TYPE5, "Redirect. Redirect for the network.");
+        case TypeCodes::CODE1:  return make_pair(TypeRequest::TYPE5, "Redirect. Redirect for the host.");
+        default: return make_pair(TypeRequest::TYPE5, "UNKNOWN CODE for TYPE5");
+        }
+    }
+    default:
+        return make_pair(TypeRequest::NONE, "UNKNOWN TYPE");
+    }
+}
+pair<TypeRequest, TypeCodes> parse_of_request(const std::vector<char>& request,size_t size, vector<char>::iterator iterator){
+    TypeRequest type;
+    TypeCodes code;
+    if (iterator != request.end()) {
+        printf("code=%02X\n", static_cast<unsigned char>(*(iterator-3)));
+        printf("type=%02X\n", static_cast<unsigned char>(*(iterator-4)));
+
+    } else {
+        cout << ("Pattern not found\n") << endl;
+    }
+    return make_pair(type, code);
 }
