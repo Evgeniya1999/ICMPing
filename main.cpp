@@ -2,6 +2,7 @@
 #include <iostream>
 #include <chrono>
 #include <ctime>
+#include <optional>
 #include <vector>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -208,10 +209,8 @@ void print_packet(const PacketData& p) {
     for (auto b : p.guid) printf("%02X ", (unsigned) b);
     cout << endl;
 }
-uint32_t bytes_to_uint32(const std::vector<uint8_t>& buffer, size_t offset) {
-    if (offset + 4 > buffer.size()) {
-        return 0;
-    }
+optional<uint32_t> bytes_to_uint32(const vector<uint8_t>& buffer, size_t offset) {
+    if (offset + 4 > buffer.size()) return nullopt;
     uint32_t value;
     memcpy(&value, buffer.data() + offset, sizeof(uint32_t));
     return value;
@@ -260,7 +259,7 @@ void print_hex(const char* data, int len, int countBytes)
 
     if (countBytes) cout << "size: " << countBytes << " bytes" << endl;
     cout << hex << uppercase << setfill('0');
-    size_t to_show = std::min(static_cast<size_t>(len), static_cast<size_t>(50));
+    size_t to_show = min(static_cast<size_t>(len), static_cast<size_t>(50));
     for (size_t i = 0; i < to_show; ++i){
         cout << setw(2) << (static_cast<unsigned int>(static_cast<unsigned char>(data[i]))) << ' ';//сначала перевод в символ для преобразования от 0-255, затем в int чтобы перевести в число
         if (i == 19) cout << "     ";
@@ -354,35 +353,51 @@ void read_socket(SOCKET &s,
         if (ip_header_len < IP_HDR_MIN || static_cast<size_t>(recv_len) < ip_header_len + ICMP_HDR_MIN) continue;
 
         const uint8_t* icmp_start = reinterpret_cast<const uint8_t*>(recvBuffer.data()) + ip_header_len;
+        size_t total_icmp_len = static_cast<size_t>(recv_len) - ip_header_len;
         ICMPhdr l_icmp;
-        memcpy(&l_icmp, icmp_start, std::min(sizeof(ICMPhdr), static_cast<size_t>(recv_len) - ip_header_len));
+        memcpy(&l_icmp, icmp_start, min(sizeof(ICMPhdr), static_cast<size_t>(recv_len) - ip_header_len));
         uint8_t type = l_icmp.type;
         uint8_t code = l_icmp.code;
-        uint32_t guid = l_icmp.data;
 
-        bool matched = false;
         for (auto &pkt : packets) {
             if (pkt.status == PacketStatus::SENT) {
-                uint32_t sent_guid = ntohl(bytes_to_uint32(pkt.guid,0));
+                auto sent_guid_opt = bytes_to_uint32(pkt.guid, 0);
+                uint32_t sent_guid = ntohl(*sent_guid_opt);
                 uint32_t recv_guid = ntohl(l_icmp.data);
-                if (sent_guid == recv_guid && !is_error((TypeRequest)type)) {
-                    pkt.status = PacketStatus::RESP_RECVD;
-                    status_of_err((TypeRequest)type, (TypeCodes)code);
+
+                if (total_icmp_len < ICMP_HDR_MIN) {
+                    pkt.status = PacketStatus::RESP_ERROR;
                     pkt.receive_timestamp = chrono::steady_clock::now();
-                    auto dur_ms = chrono::duration_cast<chrono::milliseconds>(pkt.receive_timestamp - pkt.send_timestamp).count();
-                    cout << "Packet id: " << pkt.id << " is Ok! "<< " duration: " << dur_ms << " ms\n";
-                    cout << hex << "guid: ";
-                    for (unsigned char byte : pkt.guid) {
-                        cout << setw(2) << setfill('0') << hex << (int)byte << " ";
-                    }
-                    cout << dec << " type: " << (int)type << " code: " << (int)code << endl;
-                    matched = true;
                     break;
                 }
+                if (!sent_guid_opt) {
+                    pkt.status = PacketStatus::RESP_ERROR;
+                    pkt.receive_timestamp = chrono::steady_clock::now();
+                    break;
+                }
+
+                if (sent_guid == recv_guid) {
+                    if (total_icmp_len > ICMP_HDR_MIN) {
+                        pkt.status = PacketStatus::RESP_ERROR;
+                        if (is_error((TypeRequest)type)) status_of_err((TypeRequest)type, (TypeCodes)code);
+                    } else {
+                        pkt.status = PacketStatus::RESP_RECVD;
+                    }
+                } else {
+                    pkt.status = PacketStatus::RESP_ERROR;
+                    if (is_error((TypeRequest)type)) status_of_err((TypeRequest)type, (TypeCodes)code);
+                }
+
+                pkt.receive_timestamp = chrono::steady_clock::now();
+                auto dur_ms = chrono::duration_cast<chrono::milliseconds>(pkt.receive_timestamp - pkt.send_timestamp).count();
+                cout << "Packet id: " << pkt.id << " duration: " << dur_ms << " ms\n";
+                cout << hex << "guid: ";
+                for (unsigned char byte : pkt.guid) {
+                    cout << setw(2) << setfill('0') << hex << (int)byte << " ";
+                }
+                cout << dec << " type: " << (int)type << " code: " << (int)code << endl;
+                break;
             }
-        }
-        if (!matched) {
-            cout << "No matching packet guid found in this response\n";
         }
         cout << "response in Hex: ";
         print_hex(recvBuffer.data(), (int)recvBuffer.size(), recv_flag);
@@ -408,7 +423,7 @@ int main()
     vector<char> sendBuffer;
     vector<PacketData> packets;
 
-    auto next_send = std::chrono::steady_clock::now();
+    auto next_send = chrono::steady_clock::now();
 
     int countPacket = 4;
     int currPacket = 0;
