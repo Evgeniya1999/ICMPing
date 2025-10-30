@@ -10,11 +10,14 @@ SOURCES += \
         main.cpp
 
 
+#win32 {
+#    LIBS += -lws2_32
+#}
+#win32{
+#    LIBS += -lole32
+#}
 win32 {
-    LIBS += -lws2_32
-}
-win32{
-    LIBS += -lole32
+    LIBS = -lrpcrt4 -lws2_32 -lole32
 }
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin

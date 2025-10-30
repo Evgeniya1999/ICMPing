@@ -11,6 +11,7 @@
 #include <objbase.h>
 #include <algorithm>
 #include <cstdint>
+#include <array>
 
 //namespaces
 using namespace std;
@@ -27,8 +28,11 @@ const int SEND_INTERVAL_MS = 1000;
 const int RESPONSE_TIMEOUT_MS = 4000;
 const char* sin_addr = "8.8.8.8";
 
-constexpr size_t ICMP_HDR_MIN = 8;
+constexpr size_t ICMP_HDR_MIN = 20;
 constexpr size_t IP_HDR_MIN = 20;
+
+const int GUID_LEN = 16;
+
 //structurs
 enum class PacketStatus {
     NSEND,
@@ -56,7 +60,7 @@ struct PacketData {
     PacketStatus status = PacketStatus::NSEND;
     chrono::steady_clock::time_point send_timestamp;
     chrono::steady_clock::time_point receive_timestamp;
-    vector<uint8_t> guid;
+    uint8_t guid[16];
 };
 #pragma pack(pop)
 #pragma pack(push,1)
@@ -78,7 +82,7 @@ struct ICMPhdr {
     uint8_t type;
     uint8_t code;
     uint16_t checksum;
-    uint32_t data;
+    uint8_t data[16];;
 };
 #pragma pack(pop)
 
@@ -126,6 +130,7 @@ bool is_error (TypeRequest type){
         return true;
     } else return false;
 }
+
 uint16_t icmp_checksum(const void *data, size_t len) {
     const uint8_t *bytes = reinterpret_cast<const uint8_t*>(data);
     uint32_t sum = 0;
@@ -147,40 +152,120 @@ uint16_t icmp_checksum(const void *data, size_t len) {
 
     return static_cast<uint16_t>(~sum);
 }
-unsigned long create_guid_part() {
+
+array<uint8_t, 16> create_guid() {
+
     GUID g;
-    if (CoCreateGuid(&g) == S_OK) {
-        // 32 бита
-        return g.Data1;
+    array<uint8_t, 16> result{};
+    HRESULT hr = CoCreateGuid(&g);
+    if (!SUCCEEDED(hr)) {
+        cerr << "CoCreateGuid failed " << "\n";
+        return result;
     }
-    return 0;
+    RPC_CSTR guidStr = nullptr; //тип для вывода формата guid
+    if (UuidToStringA(&g, &guidStr) == RPC_S_OK && guidStr != nullptr) {
+        cout << "Generated GUID: " << reinterpret_cast<char*>(guidStr) << "\n";
+        RpcStringFreeA(&guidStr);
+    }
+    uint32_t d1 = htonl(g.Data1);
+    uint16_t d2 = htons(g.Data2);
+    uint16_t d3 = htons(g.Data3);
+
+    memcpy(result.data() + 0, &d1, 4);
+    memcpy(result.data() + 4, &d2, 2);
+    memcpy(result.data() + 6, &d3, 2);
+    memcpy(result.data() + 8, g.Data4, 8);
+
+    return result;
+}
+void print_hex(const char* data, int len, int countBytes)
+{
+    if (countBytes) cout << "size: " << countBytes << " bytes" << endl;
+    cout << hex << uppercase << setfill('0');
+    size_t to_show = min(static_cast<size_t>(len), static_cast<size_t>(50));
+    for (size_t i = 0; i < to_show; ++i){
+        cout << setw(2) << (static_cast<unsigned int>(static_cast<unsigned char>(data[i]))) << ' ';//сначала перевод в символ для преобразования от 0-255, затем в int чтобы перевести в число
+        if (i == 19) cout << "     ";
+    }
+    cout << dec << endl;
+}
+void print_bytes_hex(const uint8_t* data, size_t len) {
+    if (!data || len == 0) {
+        cout << "(empty)\n";
+        return;
+    }
+    ios oldState(nullptr);
+    oldState.copyfmt(cout);
+
+    for (size_t i = 0; i < len; ++i) {
+        unsigned int b = static_cast<unsigned char>(data[i]);
+        cout << hex << uppercase << setw(2) << setfill('0') << b;
+        if (i + 1 < len) std::cout << ' ';
+    }
+    cout << dec << '\n';
+    cout.copyfmt(oldState);
+
+}
+void print_data_cout(const std::vector<char>& v) {
+    if (v.empty()) {
+        std::cout << "(empty)\n";
+        return;
+    }
+    std::cout << "v.size=" << v.size() << '\n';
+    print_bytes_hex(reinterpret_cast<const uint8_t*>(v.data()), v.size());
+}
+
+void print_data_cout(const uint8_t data[16]) {
+    if (!data) {
+        std::cout << "(null)\n";
+        return;
+    }
+    print_bytes_hex(data, 16);
 }
 vector<char> packetForm(){
     ICMPhdr icmphdr;
-    auto resultGuid = create_guid_part();
+    auto resultGuid = create_guid();
+    if (resultGuid.size() != 16) {
+        cerr << "create_guid returned size != 16" << std::endl;
+        return {};
+    }
 
     icmphdr.type = 8;
     icmphdr.code = 0;
-    icmphdr.data = htonl(resultGuid);
+    memcpy(icmphdr.data, resultGuid.data(), sizeof(icmphdr.data));
     icmphdr.checksum = 0;
 
-    //копирование структуры в буфер
-    vector<char> sendBuffer(sizeof(ICMPhdr));
-    memcpy(sendBuffer.data(), &icmphdr, sizeof(icmphdr));
-    //дополнительная ф-я что значение crc в структуре 0
-    size_t cs_off = offsetof(ICMPhdr, checksum);
-    memset(sendBuffer.data() + cs_off, 0, sizeof(uint16_t));
-    //вычисление crc
-    uint16_t cs = icmp_checksum(sendBuffer.data(), sendBuffer.size());
-    //перевод в сетевой код и запись в буфер
-    uint16_t cs_net = htons(cs);
-    memcpy(sendBuffer.data() + cs_off, &cs_net, sizeof(cs_net));
+    const size_t header_size = sizeof(icmphdr.type) + sizeof(icmphdr.code) + sizeof(icmphdr.checksum);
+    const size_t payload_size = sizeof(icmphdr.data);
+    const size_t total_size = header_size + payload_size;
+    cout << "total_size: " << total_size << endl;
 
-    cout << "--------------------------" << endl;
+    vector<char> sendBuffer(total_size);
+    size_t offset = 0;
+    sendBuffer[offset++] = static_cast<char>(icmphdr.type);
+    sendBuffer[offset++] = static_cast<char>(icmphdr.code);
+    sendBuffer[offset++] = 0; //checksum
+    sendBuffer[offset++] = 0; //checksum
+    memcpy(sendBuffer.data() + offset, icmphdr.data, payload_size);
+    offset += payload_size;
+
+    uint16_t crc = icmp_checksum(sendBuffer.data(), sendBuffer.size());
+    uint16_t crc_net = htons(crc);
+    memcpy(sendBuffer.data() + sizeof(icmphdr.checksum), &crc_net, sizeof(crc_net));
+
+    cout << "header_size=" << header_size
+              << " payload_size=" << payload_size
+              << " total_size=" << total_size << std::endl;
+
     cout << "Packet: " << endl;
-    printf("type=%02X code=%02X ", icmphdr.type, icmphdr.code);
-    printf("checksum=%04X ", cs_net);
-    printf("payload=%08X ", icmphdr.data);
+    printf("type=%02X code=%02X ", icmphdr.type, icmphdr.code); cout << sizeof(icmphdr.type) + sizeof(icmphdr.code) << endl;
+    printf("checksum=%04X ", static_cast<unsigned int>(crc_net & 0xFFFF)); cout << sizeof(crc_net) << endl;
+    printf("payload = ");
+    print_data_cout(icmphdr.data);
+    cout << "icmphdr.data.size() = " << sizeof(icmphdr.data) << endl;
+    cout << "bytes in data = " << (sizeof(icmphdr.data) * sizeof(char)) << endl;
+    cout << "--------------------------" << endl;
+
     return sendBuffer;
 }
 
@@ -209,12 +294,7 @@ void print_packet(const PacketData& p) {
     for (auto b : p.guid) printf("%02X ", (unsigned) b);
     cout << endl;
 }
-optional<uint32_t> bytes_to_uint32(const vector<uint8_t>& buffer, size_t offset) {
-    if (offset + 4 > buffer.size()) return nullopt;
-    uint32_t value;
-    memcpy(&value, buffer.data() + offset, sizeof(uint32_t));
-    return value;
-}
+
 int init_socket(SOCKET &s){
     WORD wVersionRequested;
     WSADATA wsaData;
@@ -252,21 +332,18 @@ int init_socket(SOCKET &s){
         WSACleanup();
         return -1;
     }
+    int ttl_value = 1;
+    if ( setsockopt( s, IPPROTO_IP, IP_TTL, (const char*)&ttl_value,  sizeof(ttl_value)) != 0 )
+    {
+        int error_code = WSAGetLastError();
+        cerr << "nonblocking socket failed with error: " << error_code << endl;
+        closesocket(s);
+        WSACleanup();
+        return -1;
+    }
     return 0;
 }
-void print_hex(const char* data, int len, int countBytes)
-{
 
-    if (countBytes) cout << "size: " << countBytes << " bytes" << endl;
-    cout << hex << uppercase << setfill('0');
-    size_t to_show = min(static_cast<size_t>(len), static_cast<size_t>(50));
-    for (size_t i = 0; i < to_show; ++i){
-        cout << setw(2) << (static_cast<unsigned int>(static_cast<unsigned char>(data[i]))) << ' ';//сначала перевод в символ для преобразования от 0-255, затем в int чтобы перевести в число
-        if (i == 19) cout << "     ";
-        if (i == 27) cout << "     ";
-    }
-    cout << dec << endl;
-}
 bool send_packets(SOCKET &s,
                   sockaddr_in const& dest_addr,
                   vector<char>& sendBuffer,
@@ -284,21 +361,26 @@ bool send_packets(SOCKET &s,
                                0,
                                (struct sockaddr*)&dest_addr,
                                sizeof(dest_addr));
-        cout << "send buffer size: " << sendBuffer.size() << " byte" << endl;
+        cout << "elements in sendBuffer: " << sendBuffer.size() << " byte" <<  endl;
 
         if (send_flag == SOCKET_ERROR) {
             int error_code = WSAGetLastError();
             cerr << "sendto failed with error: " << error_code << endl;
-            return true; // сигнализируем об ошибке чтобы выйти из цикла
+            return true;
         } else {
             PacketData packetData;
             packetData.id = currPacket;
             packetData.status = PacketStatus::SENT;
             packetData.send_timestamp = chrono::steady_clock::now();
             size_t data_off = offsetof(ICMPhdr, data);
-            if (sendBuffer.size() >= data_off + sizeof(uint32_t)) {
-                packetData.guid.assign(sendBuffer.begin() + data_off,
-                                       sendBuffer.begin() + data_off + sizeof(uint32_t));
+            if (sendBuffer.size() >= data_off + GUID_LEN) {
+                memcpy(packetData.guid, sendBuffer.data() + data_off, sizeof(packetData.guid));
+                //packetData.guid.assign(sendBuffer.begin() + data_off,
+                //                       sendBuffer.begin() + data_off + GUID_LEN);
+                cout << "packetData.guid " ;
+                print_data_cout(packetData.guid);
+            } else {
+                memset(packetData.guid, 0, sizeof(packetData.guid));
             }
 
             cout << "send Hex: ";
@@ -313,7 +395,7 @@ bool send_packets(SOCKET &s,
     }
     return false;
 }
-void check_timeout(vector<PacketData>& packets, int RESPONSE_TIMEOUT_MS)
+void check_timeout(vector<PacketData>& packets,const int RESPONSE_TIMEOUT_MS)
 {
     auto now = chrono::steady_clock::now();
     for (auto& pkt : packets) {
@@ -354,6 +436,7 @@ void read_socket(SOCKET &s,
 
         const uint8_t* icmp_start = reinterpret_cast<const uint8_t*>(recvBuffer.data()) + ip_header_len;
         size_t total_icmp_len = static_cast<size_t>(recv_len) - ip_header_len;
+        cout << "res total_icmp_len: " << total_icmp_len << endl;
         ICMPhdr l_icmp;
         memcpy(&l_icmp, icmp_start, min(sizeof(ICMPhdr), static_cast<size_t>(recv_len) - ip_header_len));
         uint8_t type = l_icmp.type;
@@ -361,22 +444,23 @@ void read_socket(SOCKET &s,
 
         for (auto &pkt : packets) {
             if (pkt.status == PacketStatus::SENT) {
-                auto sent_guid_opt = bytes_to_uint32(pkt.guid, 0);
-                uint32_t sent_guid = ntohl(*sent_guid_opt);
-                uint32_t recv_guid = ntohl(l_icmp.data);
 
+                if (is_error((TypeRequest)type)) {
+                    status_of_err((TypeRequest)type, (TypeCodes)code);
+                    pkt.status = PacketStatus::RESP_ERROR;
+                    pkt.receive_timestamp = chrono::steady_clock::now();
+                    break;
+                }
                 if (total_icmp_len < ICMP_HDR_MIN) {
                     pkt.status = PacketStatus::RESP_ERROR;
                     pkt.receive_timestamp = chrono::steady_clock::now();
                     break;
                 }
-                if (!sent_guid_opt) {
-                    pkt.status = PacketStatus::RESP_ERROR;
-                    pkt.receive_timestamp = chrono::steady_clock::now();
-                    break;
-                }
-
-                if (sent_guid == recv_guid) {
+                cout << "pkt.guid " << sizeof(pkt.guid) << " ";
+                print_data_cout(pkt.guid);
+                cout << "l_icmp.data " << sizeof(l_icmp.data) << " ";
+                print_data_cout(l_icmp.data);
+                if (equal(pkt.guid,pkt.guid+GUID_LEN, l_icmp.data)){
                     if (total_icmp_len > ICMP_HDR_MIN) {
                         pkt.status = PacketStatus::RESP_ERROR;
                         if (is_error((TypeRequest)type)) status_of_err((TypeRequest)type, (TypeCodes)code);
@@ -404,9 +488,9 @@ void read_socket(SOCKET &s,
         cout << endl;
     }
 }
-
 int main()
 {
+
     if (init_socket(sock) != 0) {
         cerr << "socket init failed\n";
         return 1;
@@ -424,7 +508,6 @@ int main()
     vector<PacketData> packets;
 
     auto next_send = chrono::steady_clock::now();
-
     int countPacket = 4;
     int currPacket = 0;
 
@@ -449,21 +532,61 @@ int main()
             cout << "Все пакеты отправлены." << endl;
             break;
         }
+         WSAEVENT ev = WSACreateEvent();
+         if (ev == WSA_INVALID_EVENT) { cerr << "WSACreateEvent failed: " << WSAGetLastError() << endl; }
+
+        // Привязать событие к сокету (раскомментируйте при тесте):
+         if (WSAEventSelect(sock, ev, FD_READ | FD_CLOSE /* | FD_OOB */) == SOCKET_ERROR) {
+             cerr << "WSAEventSelect failed: " << WSAGetLastError() << endl;
+         } else {
+             // Теперь ждём события с небольшим таймаутом — чтобы сохранить неблокирующую семантику
+             DWORD wait_res = WSAWaitForMultipleEvents(1, &ev, FALSE, 0 /*таймаут ms*/, FALSE);
+             if (wait_res == WSA_WAIT_TIMEOUT) {
+                 // ничего нового — продолжаем (эквивалент неблокирующего поведения)
+             } else if (wait_res >= WSA_WAIT_EVENT_0 && wait_res < WSA_WAIT_EVENT_0 + 1) {
+        //         // событие произошло — нужно узнать, какие сетевые события
+                 WSANETWORKEVENTS netev;
+                 if (WSAEnumNetworkEvents(sock, ev, &netev) == SOCKET_ERROR) {
+                     cerr << "WSAEnumNetworkEvents failed: " << WSAGetLastError() << endl;
+                 } else {
+                     if (netev.lNetworkEvents & FD_READ) {
+                         // Когда FD_READ — читаем в цикле так же, как в read_socket
+                         cout << "WSAEventSelect: FD_READ signalled" << endl;
+                         // Можно вызвать ту же функцию чтения:
+                         read_socket(sock, recvBuffer, packets, currPacket);
+                     }
+                     if (netev.lNetworkEvents & FD_CLOSE) {
+                         cout << "WSAEventSelect: FD_CLOSE" << endl;
+                     }
+                     if (netev.lNetworkEvents & FD_OOB) {
+                         cout << "WSAEventSelect: FD_OOB" << endl;
+                     }
+                 }
+                 // Сброс события (не всегда обязателен): WSAResetEvent(ev);
+             } else {
+                 // Упс — ошибка ожидания
+                 cerr << "WSAWaitForMultipleEvents unexpected result: " << wait_res << endl;
+             }
+         }
+        //
+        // В конце (при завершении) не забудьте:
+         if (ev != WSA_INVALID_EVENT) WSACloseEvent(ev);
+
 
         // select и чтение ответов
-        FD_ZERO(&readfs);
-        FD_SET(sock, &readfs);
-        timeval select_timeout{0, 100000};
-        int select_flag = select(0, &readfs, NULL, NULL, &select_timeout);
-        if (select_flag == SOCKET_ERROR) {
-            int error_code = WSAGetLastError();
-            cerr << "select failed with error: " << error_code << endl;
-            break;
-        }
-        if (FD_ISSET(sock, &readfs)) {
-            cout << "socket is ready!" << endl;
-            read_socket(sock, recvBuffer, packets, currPacket);
-        }
+        //FD_ZERO(&readfs);
+        //FD_SET(sock, &readfs);
+        //timeval select_timeout{0, 100000};
+        //int select_flag = select(0, &readfs, NULL, NULL, &select_timeout);
+        //if (select_flag == SOCKET_ERROR) {
+        //    int error_code = WSAGetLastError();
+        //    cerr << "select failed with error: " << error_code << endl;
+        //    break;
+        //}
+        //if (FD_ISSET(sock, &readfs)) {
+        //    cout << "socket is ready!" << endl;
+        //    read_socket(sock, recvBuffer, packets, currPacket);
+        //}
 
         Sleep(1);
     }
@@ -475,7 +598,10 @@ int main()
 
     closesocket(sock);
     WSACleanup();
+    cout << "Нажмите любую клавишу для выхода...";
+    cin.get();
     return 0;
 }
+
 
 
