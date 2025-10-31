@@ -18,6 +18,7 @@ using namespace std;
 using namespace std::chrono;
 //variables
 SOCKET sock = INVALID_SOCKET;
+WSAEVENT recvEvent;
 
 int socket_flag;
 int recv_flag;
@@ -82,7 +83,9 @@ struct ICMPhdr {
     uint8_t type;
     uint8_t code;
     uint16_t checksum;
-    uint8_t data[16];;
+    uint16_t identifier;
+    uint16_t sequence;
+    uint8_t data[16];
 };
 #pragma pack(pop)
 
@@ -222,7 +225,7 @@ void print_data_cout(const uint8_t data[16]) {
     }
     print_bytes_hex(data, 16);
 }
-vector<char> packetForm(){
+vector<char> packetForm(int currP){
     ICMPhdr icmphdr;
     auto resultGuid = create_guid();
     if (resultGuid.size() != 16) {
@@ -232,6 +235,8 @@ vector<char> packetForm(){
 
     icmphdr.type = 8;
     icmphdr.code = 0;
+    icmphdr.identifier = htons(1234);
+    icmphdr.sequence = htons(currP);
     memcpy(icmphdr.data, resultGuid.data(), sizeof(icmphdr.data));
     icmphdr.checksum = 0;
 
@@ -251,8 +256,7 @@ vector<char> packetForm(){
 
     uint16_t crc = icmp_checksum(sendBuffer.data(), sendBuffer.size());
     uint16_t crc_net = htons(crc);
-    memcpy(sendBuffer.data() + sizeof(icmphdr.checksum), &crc_net, sizeof(crc_net));
-
+    memcpy(sendBuffer.data() + offsetof(ICMPhdr, checksum), &crc_net, sizeof(crc_net));
     cout << "header_size=" << header_size
               << " payload_size=" << payload_size
               << " total_size=" << total_size << std::endl;
@@ -332,6 +336,12 @@ int init_socket(SOCKET &s){
         WSACleanup();
         return -1;
     }
+    DWORD dwBytesReturned = 0;
+    BOOL bOptVal = TRUE;
+    if (WSAIoctl(s, SIO_RCVALL, &bOptVal, sizeof(bOptVal),
+                 NULL, 0, &dwBytesReturned, NULL, NULL) == SOCKET_ERROR) {
+        // Обработка ошибки WSAGetLastError()
+    }
     int ttl_value = 1;
     if ( setsockopt( s, IPPROTO_IP, IP_TTL, (const char*)&ttl_value,  sizeof(ttl_value)) != 0 )
     {
@@ -341,7 +351,23 @@ int init_socket(SOCKET &s){
         WSACleanup();
         return -1;
     }
+
+    recvEvent = WSACreateEvent();
+    if (recvEvent == WSA_INVALID_EVENT){
+        cerr << "WSACreateEvent failed: " << WSAGetLastError() << endl;
+        closesocket(s);
+        WSACleanup();
+        return -1;
+    }
+    if (WSAEventSelect(s, recvEvent, FD_READ | FD_CLOSE | FD_OOB) == SOCKET_ERROR){
+        cerr << "WSAEventSelect failed: " <<  WSAGetLastError() << endl;
+        WSACloseEvent(recvEvent);
+        closesocket(s);
+        WSACleanup();
+        return -1;
+    }
     return 0;
+
 }
 
 bool send_packets(SOCKET &s,
@@ -354,7 +380,7 @@ bool send_packets(SOCKET &s,
 {
     auto now = chrono::steady_clock::now();
     if (currPacket <= countPacket - 1 && now >= next_send) {
-        sendBuffer = packetForm();
+        sendBuffer = packetForm(currPacket);
         int send_flag = sendto(s,
                                sendBuffer.data(),
                                static_cast<int>(sendBuffer.size()),
@@ -413,8 +439,13 @@ void read_socket(SOCKET &s,
                  int& currPacket)
 {
     while (true) {
+
+        char buffer[1024];
+
         sockaddr_in sender_addr;
         int sender_addr_len = sizeof(sender_addr);
+
+
         int recv_flag = recvfrom(s, recvBuffer.data(), static_cast<int>(recvBuffer.size()), 0,
                                  (struct sockaddr*)&sender_addr, &sender_addr_len);
         if (recv_flag == SOCKET_ERROR) {
@@ -460,7 +491,8 @@ void read_socket(SOCKET &s,
                 print_data_cout(pkt.guid);
                 cout << "l_icmp.data " << sizeof(l_icmp.data) << " ";
                 print_data_cout(l_icmp.data);
-                if (equal(pkt.guid,pkt.guid+GUID_LEN, l_icmp.data)){
+                if (total_icmp_len >= offsetof(ICMPhdr, data) + GUID_LEN &&
+                    equal(pkt.guid, pkt.guid + GUID_LEN, l_icmp.data)) {
                     if (total_icmp_len > ICMP_HDR_MIN) {
                         pkt.status = PacketStatus::RESP_ERROR;
                         if (is_error((TypeRequest)type)) status_of_err((TypeRequest)type, (TypeCodes)code);
@@ -502,6 +534,7 @@ int main()
     dest_addr.sin_addr.s_addr = inet_addr(sin_addr);
 
     fd_set readfs;
+    fd_set exceptfs;
 
     vector<char> recvBuffer(4096);
     vector<char> sendBuffer;
@@ -512,7 +545,6 @@ int main()
     int currPacket = 0;
 
     while (true) {
-        // отправка пакета
         if (send_packets(sock, dest_addr, sendBuffer, currPacket, countPacket, next_send, packets)) {
             break;
         }
@@ -532,61 +564,62 @@ int main()
             cout << "Все пакеты отправлены." << endl;
             break;
         }
-         WSAEVENT ev = WSACreateEvent();
-         if (ev == WSA_INVALID_EVENT) { cerr << "WSACreateEvent failed: " << WSAGetLastError() << endl; }
 
-        // Привязать событие к сокету (раскомментируйте при тесте):
-         if (WSAEventSelect(sock, ev, FD_READ | FD_CLOSE /* | FD_OOB */) == SOCKET_ERROR) {
-             cerr << "WSAEventSelect failed: " << WSAGetLastError() << endl;
-         } else {
-             // Теперь ждём события с небольшим таймаутом — чтобы сохранить неблокирующую семантику
-             DWORD wait_res = WSAWaitForMultipleEvents(1, &ev, FALSE, 0 /*таймаут ms*/, FALSE);
-             if (wait_res == WSA_WAIT_TIMEOUT) {
-                 // ничего нового — продолжаем (эквивалент неблокирующего поведения)
-             } else if (wait_res >= WSA_WAIT_EVENT_0 && wait_res < WSA_WAIT_EVENT_0 + 1) {
-        //         // событие произошло — нужно узнать, какие сетевые события
-                 WSANETWORKEVENTS netev;
-                 if (WSAEnumNetworkEvents(sock, ev, &netev) == SOCKET_ERROR) {
-                     cerr << "WSAEnumNetworkEvents failed: " << WSAGetLastError() << endl;
-                 } else {
-                     if (netev.lNetworkEvents & FD_READ) {
-                         // Когда FD_READ — читаем в цикле так же, как в read_socket
-                         cout << "WSAEventSelect: FD_READ signalled" << endl;
-                         // Можно вызвать ту же функцию чтения:
-                         read_socket(sock, recvBuffer, packets, currPacket);
-                     }
-                     if (netev.lNetworkEvents & FD_CLOSE) {
-                         cout << "WSAEventSelect: FD_CLOSE" << endl;
-                     }
-                     if (netev.lNetworkEvents & FD_OOB) {
-                         cout << "WSAEventSelect: FD_OOB" << endl;
-                     }
-                 }
-                 // Сброс события (не всегда обязателен): WSAResetEvent(ev);
-             } else {
-                 // Упс — ошибка ожидания
-                 cerr << "WSAWaitForMultipleEvents unexpected result: " << wait_res << endl;
-             }
-         }
-        //
-        // В конце (при завершении) не забудьте:
-         if (ev != WSA_INVALID_EVENT) WSACloseEvent(ev);
+        //DWORD waitResult = WSAWaitForMultipleEvents(1, &recvEvent, FALSE, 100, FALSE);
+
+        //if (waitResult == WSA_WAIT_EVENT_0) {
+        //    // Событие произошло, получаем информацию о событии
+        //    WSANETWORKEVENTS networkEvents;
+        //    if (WSAEnumNetworkEvents(sock, recvEvent, &networkEvents) == SOCKET_ERROR) {
+        //        cerr << "WSAEnumNetworkEvents failed: " << WSAGetLastError() << endl;
+        //        // Обработка ошибки
+        //        continue;
+        //    }
+
+        //    // Проверяем, что именно произошло
+        //    if (networkEvents.lNetworkEvents & FD_READ) {
+        //        // Успешно получены данные (обычный пакет или ICMP Type 11)
+        //        cout << "FD_READ event triggered. Socket is ready!" << endl;
+        //        // Ваш вызов функции чтения
+        //        read_socket(sock, recvBuffer, packets, currPacket);
+        //    }
+        //    if (networkEvents.lNetworkEvents & FD_CLOSE) {
+        //        // Соединение закрыто
+        //        cerr << "FD_CLOSE event triggered." << endl;
+        //    }
+        //    // FD_OOB и другие события, если нужно
+        //}
+        //else if (waitResult == WSA_WAIT_TIMEOUT) {
+        //    // Таймаут ожидания, продолжаем цикл
+        //    // cout << "Timeout..." << endl;
+        //}
+        //else {
+        //    // Другая ошибка WSAWaitForMultipleEvents
+        //}
 
 
+        //использовать IcmpSendEcho
         // select и чтение ответов
-        //FD_ZERO(&readfs);
-        //FD_SET(sock, &readfs);
-        //timeval select_timeout{0, 100000};
-        //int select_flag = select(0, &readfs, NULL, NULL, &select_timeout);
-        //if (select_flag == SOCKET_ERROR) {
-        //    int error_code = WSAGetLastError();
-        //    cerr << "select failed with error: " << error_code << endl;
-        //    break;
-        //}
-        //if (FD_ISSET(sock, &readfs)) {
-        //    cout << "socket is ready!" << endl;
-        //    read_socket(sock, recvBuffer, packets, currPacket);
-        //}
+        FD_ZERO(&readfs);
+        FD_ZERO(&exceptfs);
+        FD_SET(sock, &readfs);
+        FD_SET(sock, &exceptfs);
+        timeval select_timeout{0, 100000};
+        //timeval select_timeout{0, 10000};
+        int select_flag = select(0, &readfs, NULL, NULL, &select_timeout);
+        if (select_flag == SOCKET_ERROR) {
+            int error_code = WSAGetLastError();
+            cerr << "select failed with error: " << error_code << endl;
+            break;
+        }
+        if (FD_ISSET(sock, &readfs)) {
+            cout << "socket is ready!" << endl;
+            read_socket(sock, recvBuffer, packets, currPacket);
+        }
+        if (FD_ISSET(sock, &exceptfs)) { //Ядро Windows "съедает" пакет TTL exceeded, определяет, что это ошибка, и устанавливает флаг исключения на сокете, но не помещает сырые данные пакета в буфер чтения.
+            cout << "Socket ready for exception event!" << endl;
+            read_socket(sock, recvBuffer, packets, currPacket);
+        }
 
         Sleep(1);
     }

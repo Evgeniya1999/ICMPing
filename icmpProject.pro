@@ -19,7 +19,12 @@ SOURCES += \
 win32 {
     LIBS = -lrpcrt4 -lws2_32 -lole32
 }
+
+RC_FILE = app.rc
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin
 else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
+
+DISTFILES += \
+    app.rc
