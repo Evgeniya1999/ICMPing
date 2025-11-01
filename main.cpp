@@ -94,7 +94,7 @@ pair <TypeRequest, string> status_of_err(TypeRequest type, TypeCodes code) {
     switch (type) {
     case TypeRequest::TYPE3: {
         switch (code) {
-        case TypeCodes::CODE0:  return make_pair(TypeRequest::TYPE3, "Destination Unreachable. The network is unreachable.") ;
+        case TypeCodes::CODE0:  return make_pair(TypeRequest::TYPE3, "Destination Unreachable. The network is unreachable.");
         case TypeCodes::CODE1:  return make_pair(TypeRequest::TYPE3, "Destination Unreachable. The host is unreachable.");
         case TypeCodes::CODE3:  return make_pair(TypeRequest::TYPE3, "Destination Unreachable. The port is unreachable.");
         default: return make_pair(TypeRequest::TYPE3, "UNKNOWN CODE for TYPE3");
@@ -185,9 +185,9 @@ void print_hex(const char* data, int len, int countBytes)
 {
     if (countBytes) cout << "size: " << countBytes << " bytes" << endl;
     cout << hex << uppercase << setfill('0');
-    size_t to_show = min(static_cast<size_t>(len), static_cast<size_t>(50));
+    size_t to_show = min(static_cast<size_t>(len), static_cast<size_t>(60));
     for (size_t i = 0; i < to_show; ++i){
-        cout << setw(2) << (static_cast<unsigned int>(static_cast<unsigned char>(data[i]))) << ' ';//сначала перевод в символ для преобразования от 0-255, затем в int чтобы перевести в число
+        cout << setw(2) << (static_cast<unsigned int>(static_cast<unsigned char>(data[i]))) << ' '; //сначала перевод в символ для преобразования от 0-255, затем в int чтобы перевести в число
         if (i == 19) cout << "     ";
     }
     cout << dec << endl;
@@ -245,30 +245,21 @@ vector<char> packetForm(int currP){
     const size_t total_size = header_size + payload_size;
     cout << "total_size: " << total_size << endl;
 
-    vector<char> sendBuffer(total_size);
-    size_t offset = 0;
-    sendBuffer[offset++] = static_cast<char>(icmphdr.type);
-    sendBuffer[offset++] = static_cast<char>(icmphdr.code);
-    sendBuffer[offset++] = 0; //checksum
-    sendBuffer[offset++] = 0; //checksum
-    memcpy(sendBuffer.data() + offset, icmphdr.data, payload_size);
-    offset += payload_size;
+    vector<char> sendBuffer(sizeof(ICMPhdr));
+    memcpy(sendBuffer.data(), &icmphdr, sizeof(ICMPhdr));
 
-    uint16_t crc = icmp_checksum(sendBuffer.data(), sendBuffer.size());
-    uint16_t crc_net = htons(crc);
-    memcpy(sendBuffer.data() + offsetof(ICMPhdr, checksum), &crc_net, sizeof(crc_net));
-    cout << "header_size=" << header_size
-              << " payload_size=" << payload_size
-              << " total_size=" << total_size << std::endl;
 
-    cout << "Packet: " << endl;
-    printf("type=%02X code=%02X ", icmphdr.type, icmphdr.code); cout << sizeof(icmphdr.type) + sizeof(icmphdr.code) << endl;
-    printf("checksum=%04X ", static_cast<unsigned int>(crc_net & 0xFFFF)); cout << sizeof(crc_net) << endl;
-    printf("payload = ");
+    cout << "\n=== ICMP Packet #" << currP << " ===\n";
+    cout << "type=" << dec << (int)icmphdr.type
+         << " code=" << (int)icmphdr.code
+         << " id=" << ntohs(icmphdr.identifier)
+         << " seq=" << ntohs(icmphdr.sequence) << endl;
+    printf("checksum=0x%04X\n", ntohs(icmphdr.checksum));
+
+    cout << "payload (GUID) = ";
     print_data_cout(icmphdr.data);
-    cout << "icmphdr.data.size() = " << sizeof(icmphdr.data) << endl;
-    cout << "bytes in data = " << (sizeof(icmphdr.data) * sizeof(char)) << endl;
-    cout << "--------------------------" << endl;
+    cout << "sizeof(ICMPhdr) = " << sizeof(ICMPhdr) << " bytes\n";
+    cout << "--------------------------\n";
 
     return sendBuffer;
 }
@@ -287,13 +278,13 @@ string status_to_string(PacketStatus s) {
 void print_packet(const PacketData& p) {
     cout << "Packet id: " << p.id << "\n";
     cout << "  status: " << status_to_string(p.status) << "\n";
-    if (p.status == PacketStatus::RESP_RECVD) {
+    //if (p.status == PacketStatus::RESP_RECVD) {
         auto durr = chrono::duration_cast<chrono::milliseconds>(p.receive_timestamp - p.send_timestamp).count();
         cout << "  duration_time: "
              <<dec<< durr  << " ms\n";
-    } else {
-        cout << "  duration_time: --\n";
-    }
+    //} else {
+    //    cout << "  duration_time: --\n";
+    //}
     cout << "  guid: ";
     for (auto b : p.guid) printf("%02X ", (unsigned) b);
     cout << endl;
@@ -319,7 +310,8 @@ int init_socket(SOCKET &s){
         cout << "The Winsock 2.2 dll was found okay\n" << endl;
 
     //INIT SOCKET
-    s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    //s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    s = socket(AF_INET, SOCK_RAW, IPPROTO_IP); //режим сниффера
     if (s == INVALID_SOCKET) {
         int error_code = WSAGetLastError();
         cerr << "create socket failed with error: " << error_code << endl;
@@ -338,9 +330,8 @@ int init_socket(SOCKET &s){
     }
     DWORD dwBytesReturned = 0;
     BOOL bOptVal = TRUE;
-    if (WSAIoctl(s, SIO_RCVALL, &bOptVal, sizeof(bOptVal),
+    if (WSAIoctl(s, SIO_RCVALL, &bOptVal, sizeof(bOptVal), //привилегию администратора (Raw socket + SIO_RCVALL)
                  NULL, 0, &dwBytesReturned, NULL, NULL) == SOCKET_ERROR) {
-        // Обработка ошибки WSAGetLastError()
     }
     int ttl_value = 1;
     if ( setsockopt( s, IPPROTO_IP, IP_TTL, (const char*)&ttl_value,  sizeof(ttl_value)) != 0 )
@@ -350,6 +341,10 @@ int init_socket(SOCKET &s){
         closesocket(s);
         WSACleanup();
         return -1;
+    }
+    int optval = 0;
+    if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, (const char*)&optval, sizeof(optval)) == SOCKET_ERROR) {
+        cerr << "setsockopt(IP_HDRINCL) failed: " << WSAGetLastError() << endl;
     }
 
     recvEvent = WSACreateEvent();
@@ -394,16 +389,15 @@ bool send_packets(SOCKET &s,
             cerr << "sendto failed with error: " << error_code << endl;
             return true;
         } else {
-            PacketData packetData;
+            PacketData packetData{};
             packetData.id = currPacket;
             packetData.status = PacketStatus::SENT;
             packetData.send_timestamp = chrono::steady_clock::now();
+
             size_t data_off = offsetof(ICMPhdr, data);
             if (sendBuffer.size() >= data_off + GUID_LEN) {
                 memcpy(packetData.guid, sendBuffer.data() + data_off, sizeof(packetData.guid));
-                //packetData.guid.assign(sendBuffer.begin() + data_off,
-                //                       sendBuffer.begin() + data_off + GUID_LEN);
-                cout << "packetData.guid " ;
+                cout << "packetData.guid: " ;
                 print_data_cout(packetData.guid);
             } else {
                 memset(packetData.guid, 0, sizeof(packetData.guid));
@@ -411,7 +405,7 @@ bool send_packets(SOCKET &s,
 
             cout << "send Hex: ";
             if (send_flag > 0 && static_cast<size_t>(send_flag) <= sendBuffer.size()) {
-                print_hex(reinterpret_cast<const char*>(sendBuffer.data()), (int)sendBuffer.size(), send_flag);
+                print_hex(sendBuffer.data(), static_cast<int>(sendBuffer.size()), send_flag);
             }
 
             packets.push_back(packetData);
@@ -462,12 +456,14 @@ void read_socket(SOCKET &s,
 
         int recv_len = recv_flag;
         if (recv_len <= 0) continue;
-        size_t ip_header_len = (static_cast<uint8_t>(recvBuffer[0]) & 0x0F) * 4;
-        if (ip_header_len < IP_HDR_MIN || static_cast<size_t>(recv_len) < ip_header_len + ICMP_HDR_MIN) continue;
+        size_t ip_header_len = (static_cast<uint8_t>(recvBuffer[0]) & 0x0F) * 4;        
 
         const uint8_t* icmp_start = reinterpret_cast<const uint8_t*>(recvBuffer.data()) + ip_header_len;
         size_t total_icmp_len = static_cast<size_t>(recv_len) - ip_header_len;
         cout << "res total_icmp_len: " << total_icmp_len << endl;
+
+        if (ip_header_len < IP_HDR_MIN || static_cast<size_t>(recv_len) < ip_header_len + ICMP_HDR_MIN) continue;
+
         ICMPhdr l_icmp;
         memcpy(&l_icmp, icmp_start, min(sizeof(ICMPhdr), static_cast<size_t>(recv_len) - ip_header_len));
         uint8_t type = l_icmp.type;
@@ -487,10 +483,10 @@ void read_socket(SOCKET &s,
                     pkt.receive_timestamp = chrono::steady_clock::now();
                     break;
                 }
-                cout << "pkt.guid " << sizeof(pkt.guid) << " ";
-                print_data_cout(pkt.guid);
-                cout << "l_icmp.data " << sizeof(l_icmp.data) << " ";
-                print_data_cout(l_icmp.data);
+                //cout << "pkt.guid " << sizeof(pkt.guid) << " ";
+                //print_data_cout(pkt.guid);
+                //cout << "l_icmp.data " << sizeof(l_icmp.data) << " ";
+                //print_data_cout(l_icmp.data);
                 if (total_icmp_len >= offsetof(ICMPhdr, data) + GUID_LEN &&
                     equal(pkt.guid, pkt.guid + GUID_LEN, l_icmp.data)) {
                     if (total_icmp_len > ICMP_HDR_MIN) {
@@ -534,7 +530,6 @@ int main()
     dest_addr.sin_addr.s_addr = inet_addr(sin_addr);
 
     fd_set readfs;
-    fd_set exceptfs;
 
     vector<char> recvBuffer(4096);
     vector<char> sendBuffer;
@@ -601,9 +596,7 @@ int main()
         //использовать IcmpSendEcho
         // select и чтение ответов
         FD_ZERO(&readfs);
-        FD_ZERO(&exceptfs);
         FD_SET(sock, &readfs);
-        FD_SET(sock, &exceptfs);
         timeval select_timeout{0, 100000};
         //timeval select_timeout{0, 10000};
         int select_flag = select(0, &readfs, NULL, NULL, &select_timeout);
@@ -614,10 +607,6 @@ int main()
         }
         if (FD_ISSET(sock, &readfs)) {
             cout << "socket is ready!" << endl;
-            read_socket(sock, recvBuffer, packets, currPacket);
-        }
-        if (FD_ISSET(sock, &exceptfs)) { //Ядро Windows "съедает" пакет TTL exceeded, определяет, что это ошибка, и устанавливает флаг исключения на сокете, но не помещает сырые данные пакета в буфер чтения.
-            cout << "Socket ready for exception event!" << endl;
             read_socket(sock, recvBuffer, packets, currPacket);
         }
 
