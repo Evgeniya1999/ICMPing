@@ -2,7 +2,6 @@
 #include <iostream>
 #include <chrono>
 #include <ctime>
-#include <optional>
 #include <vector>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -239,6 +238,7 @@ vector<char> packetForm(int currP){
     icmphdr.sequence = htons(currP);
     memcpy(icmphdr.data, resultGuid.data(), sizeof(icmphdr.data));
     icmphdr.checksum = 0;
+    icmphdr.checksum = icmp_checksum(&icmphdr, sizeof(ICMPhdr));
 
     const size_t header_size = sizeof(icmphdr.type) + sizeof(icmphdr.code) + sizeof(icmphdr.checksum);
     const size_t payload_size = sizeof(icmphdr.data);
@@ -278,13 +278,13 @@ string status_to_string(PacketStatus s) {
 void print_packet(const PacketData& p) {
     cout << "Packet id: " << p.id << "\n";
     cout << "  status: " << status_to_string(p.status) << "\n";
-    //if (p.status == PacketStatus::RESP_RECVD) {
+    if (p.status == PacketStatus::RESP_RECVD) {
         auto durr = chrono::duration_cast<chrono::milliseconds>(p.receive_timestamp - p.send_timestamp).count();
         cout << "  duration_time: "
              <<dec<< durr  << " ms\n";
-    //} else {
-    //    cout << "  duration_time: --\n";
-    //}
+    } else {
+        cout << "  duration_time: --\n";
+    }
     cout << "  guid: ";
     for (auto b : p.guid) printf("%02X ", (unsigned) b);
     cout << endl;
@@ -310,8 +310,8 @@ int init_socket(SOCKET &s){
         cout << "The Winsock 2.2 dll was found okay\n" << endl;
 
     //INIT SOCKET
-    //s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    s = socket(AF_INET, SOCK_RAW, IPPROTO_IP); //режим сниффера
+    s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    //s = socket(AF_INET, SOCK_RAW, IPPROTO_IP); //режим сниффера
     if (s == INVALID_SOCKET) {
         int error_code = WSAGetLastError();
         cerr << "create socket failed with error: " << error_code << endl;
@@ -330,10 +330,12 @@ int init_socket(SOCKET &s){
     }
     DWORD dwBytesReturned = 0;
     BOOL bOptVal = TRUE;
-    if (WSAIoctl(s, SIO_RCVALL, &bOptVal, sizeof(bOptVal), //привилегию администратора (Raw socket + SIO_RCVALL)
-                 NULL, 0, &dwBytesReturned, NULL, NULL) == SOCKET_ERROR) {
-    }
-    int ttl_value = 1;
+    //if (WSAIoctl(s, SIO_RCVALL, &bOptVal, sizeof(bOptVal), //привилегию администратора (Raw socket + SIO_RCVALL)
+    //             NULL, 0, &dwBytesReturned, NULL, NULL) == SOCKET_ERROR) {
+    //}
+
+    //int ttl_value = 1;
+    int ttl_value = 64;
     if ( setsockopt( s, IPPROTO_IP, IP_TTL, (const char*)&ttl_value,  sizeof(ttl_value)) != 0 )
     {
         int error_code = WSAGetLastError();
@@ -434,7 +436,7 @@ void read_socket(SOCKET &s,
 {
     while (true) {
 
-        char buffer[1024];
+       //char buffer[1024];
 
         sockaddr_in sender_addr;
         int sender_addr_len = sizeof(sender_addr);
@@ -442,6 +444,7 @@ void read_socket(SOCKET &s,
 
         int recv_flag = recvfrom(s, recvBuffer.data(), static_cast<int>(recvBuffer.size()), 0,
                                  (struct sockaddr*)&sender_addr, &sender_addr_len);
+
         if (recv_flag == SOCKET_ERROR) {
             int error_code = WSAGetLastError();
             if (error_code == WSAEWOULDBLOCK) {
@@ -455,7 +458,15 @@ void read_socket(SOCKET &s,
         cout << "Get packet № " << currPacket << endl;
 
         int recv_len = recv_flag;
+        if (recv_len == SOCKET_ERROR) {
+            std::cout << "recv error: " << WSAGetLastError() << std::endl;
+        }
         if (recv_len <= 0) continue;
+        if (recv_len < (int)sizeof(IPHdr)) continue;
+
+        IPHdr* ip = (IPHdr*)recvBuffer.data();
+        if (ip->ip_p != IPPROTO_ICMP)
+            continue;
         size_t ip_header_len = (static_cast<uint8_t>(recvBuffer[0]) & 0x0F) * 4;        
 
         const uint8_t* icmp_start = reinterpret_cast<const uint8_t*>(recvBuffer.data()) + ip_header_len;
@@ -483,17 +494,15 @@ void read_socket(SOCKET &s,
                     pkt.receive_timestamp = chrono::steady_clock::now();
                     break;
                 }
-                //cout << "pkt.guid " << sizeof(pkt.guid) << " ";
-                //print_data_cout(pkt.guid);
-                //cout << "l_icmp.data " << sizeof(l_icmp.data) << " ";
-                //print_data_cout(l_icmp.data);
                 if (total_icmp_len >= offsetof(ICMPhdr, data) + GUID_LEN &&
                     equal(pkt.guid, pkt.guid + GUID_LEN, l_icmp.data)) {
-                    if (total_icmp_len > ICMP_HDR_MIN) {
-                        pkt.status = PacketStatus::RESP_ERROR;
-                        if (is_error((TypeRequest)type)) status_of_err((TypeRequest)type, (TypeCodes)code);
-                    } else {
-                        pkt.status = PacketStatus::RESP_RECVD;
+                    if (type == 0) { // Echo Reply
+                        if (total_icmp_len >= offsetof(ICMPhdr, data) + GUID_LEN &&
+                            equal(pkt.guid, pkt.guid + GUID_LEN, l_icmp.data)) {
+                            pkt.status = PacketStatus::RESP_RECVD;
+                        } else {
+                            pkt.status = PacketStatus::RESP_ERROR;
+                        }
                     }
                 } else {
                     pkt.status = PacketStatus::RESP_ERROR;
@@ -560,45 +569,10 @@ int main()
             break;
         }
 
-        //DWORD waitResult = WSAWaitForMultipleEvents(1, &recvEvent, FALSE, 100, FALSE);
-
-        //if (waitResult == WSA_WAIT_EVENT_0) {
-        //    // Событие произошло, получаем информацию о событии
-        //    WSANETWORKEVENTS networkEvents;
-        //    if (WSAEnumNetworkEvents(sock, recvEvent, &networkEvents) == SOCKET_ERROR) {
-        //        cerr << "WSAEnumNetworkEvents failed: " << WSAGetLastError() << endl;
-        //        // Обработка ошибки
-        //        continue;
-        //    }
-
-        //    // Проверяем, что именно произошло
-        //    if (networkEvents.lNetworkEvents & FD_READ) {
-        //        // Успешно получены данные (обычный пакет или ICMP Type 11)
-        //        cout << "FD_READ event triggered. Socket is ready!" << endl;
-        //        // Ваш вызов функции чтения
-        //        read_socket(sock, recvBuffer, packets, currPacket);
-        //    }
-        //    if (networkEvents.lNetworkEvents & FD_CLOSE) {
-        //        // Соединение закрыто
-        //        cerr << "FD_CLOSE event triggered." << endl;
-        //    }
-        //    // FD_OOB и другие события, если нужно
-        //}
-        //else if (waitResult == WSA_WAIT_TIMEOUT) {
-        //    // Таймаут ожидания, продолжаем цикл
-        //    // cout << "Timeout..." << endl;
-        //}
-        //else {
-        //    // Другая ошибка WSAWaitForMultipleEvents
-        //}
-
-
-        //использовать IcmpSendEcho
         // select и чтение ответов
         FD_ZERO(&readfs);
         FD_SET(sock, &readfs);
         timeval select_timeout{0, 100000};
-        //timeval select_timeout{0, 10000};
         int select_flag = select(0, &readfs, NULL, NULL, &select_timeout);
         if (select_flag == SOCKET_ERROR) {
             int error_code = WSAGetLastError();
