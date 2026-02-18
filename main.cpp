@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 
-#pragma comment(lib, "ws2_32.lib")
+//#pragma comment(lib, "ws2_32.lib")
 
 using namespace std;
 using namespace std::chrono;
@@ -31,7 +31,6 @@ const int GUID_LEN = 16;
 
 bool all_responses_received;
 
-// структура статусов и типов
 enum class PacketStatus {
     NSEND,
     SENT,
@@ -47,7 +46,6 @@ enum class TypeRequest{
     TYPE5=5
 };
 enum class TypeCodes{
-    NONE,
     CODE0,
     CODE1,
     CODE3=3
@@ -61,9 +59,7 @@ struct PacketData {
     chrono::steady_clock::time_point receive_timestamp;
     uint8_t guid[GUID_LEN];
 };
-#pragma pack(pop)
 
-#pragma pack(push,1)
 struct IPHdr {
     u_char      ip_v_ihl;   // Version (4 bits) and Header Length (4 bits)
     u_char      ip_tos;     // Type of Service
@@ -76,9 +72,7 @@ struct IPHdr {
     struct in_addr ip_src;  // Source Address
     struct in_addr ip_dst;  // Destination Address
 };
-#pragma pack(pop)
 
-#pragma pack(push,1)
 struct ICMPhdr {
     uint8_t type;
     uint8_t code;
@@ -151,11 +145,12 @@ uint16_t icmp_checksum(const void *data, size_t len) {
 void print_hex(const char* data, int len, int countBytes)
 {
     if (countBytes) cout << "size: " << countBytes << " bytes" << endl;
+    cout << "send Hex: ";
     cout << hex << uppercase << setfill('0');
     size_t to_show = min(static_cast<size_t>(len), static_cast<size_t>(60));
     for (size_t i = 0; i < to_show; ++i){
         cout << setw(2) << (static_cast<unsigned int>(static_cast<unsigned char>(data[i]))) << ' ';
-        if (i == 19) cout << "     ";
+        if (i == 7) cout << "     ";
     }
     cout << dec << endl;
 }
@@ -172,7 +167,8 @@ void print_bytes_hex(const uint8_t* data, size_t len) {
         if (i + 1 < len) std::cout << ' ';
     }
     cout << dec << '\n';
-    cout.copyfmt(oldState);}
+    cout.copyfmt(oldState);
+}
 void print_data_cout(const std::vector<char>& v) {
     if (v.empty()) {
         std::cout << "(empty)\n";
@@ -230,6 +226,7 @@ vector<char> packetForm(int currP){
 
     return sendBuffer;
 }
+
 
 string status_to_string(PacketStatus s) {
     switch (s) {
@@ -291,7 +288,7 @@ int init_socket(SOCKET &s){
         return -1;
     }
 
-    int ttl_value = 120;
+    int ttl_value = 110;
     if ( setsockopt( s, IPPROTO_IP, IP_TTL, (const char*)&ttl_value,  sizeof(ttl_value)) != 0 ) {
         int error_code = WSAGetLastError();
         cerr << "setsockopt TTL failed with error: " << error_code << endl;
@@ -372,16 +369,18 @@ void check_timeout(vector<PacketData>& packets,const int RESPONSE_TIMEOUT_MS)
         }
     }
 }
+string bool_to_string(bool b){
+    return b ? "true" : "false";
+}
 
 void read_socket(SOCKET &s,
                  vector<char>& recvBuffer,
-                 vector<PacketData>& packets,
-                 int& currPacket)
+                 vector<PacketData>& packets)
 {
     while (true) {
         sockaddr_in sender_addr;
-        int sender_addr_len = sizeof(sender_addr);    int recv_len = recvfrom(s, recvBuffer.data(), static_cast<int>(recvBuffer.size()), 0,
-                                (struct sockaddr*)&sender_addr, &sender_addr_len);
+        int sender_addr_len = sizeof(sender_addr);
+        int recv_len = recvfrom(s, recvBuffer.data(), static_cast<int>(recvBuffer.size()), 0,(struct sockaddr*)&sender_addr, &sender_addr_len);
 
         if (recv_len == SOCKET_ERROR) {
             int error_code = WSAGetLastError();
@@ -392,93 +391,84 @@ void read_socket(SOCKET &s,
                 break;
             }
         }
-        if (recv_len <= 0) continue;
-        if (recv_len < (int)sizeof(IPHdr)) continue;
+        if (recv_len < (int)sizeof(IPHdr)) continue; //длина валидна
 
         cout << "Get raw packet size=" << recv_len << endl;
 
         IPHdr* ip = reinterpret_cast<IPHdr*>(recvBuffer.data());
-        if (ip->ip_p != IPPROTO_ICMP) {
-            // не ICMP
-            continue;
-        }
+        if (ip->ip_p != IPPROTO_ICMP) {continue;}// не ICMP
 
         size_t ip_header_len = (static_cast<uint8_t>(recvBuffer[0]) & 0x0F) * 4;
-        if (ip_header_len < IP_HDR_MIN || static_cast<size_t>(recv_len) < ip_header_len + ICMP_HDR_MIN) {
-            // не хватает данных
-            continue;
-        }
+        if (ip_header_len < IP_HDR_MIN || //миним длина IP заголовка
+            static_cast<size_t>(recv_len) < ip_header_len + ICMP_HDR_MIN) {continue;} // IP заголовок не валиден
 
-        const uint8_t* icmp_start = reinterpret_cast<const uint8_t*>(recvBuffer.data()) + ip_header_len;
-        size_t total_icmp_len = static_cast<size_t>(recv_len) - ip_header_len;
+        uint8_t* icmp_start = reinterpret_cast<uint8_t*>(recvBuffer.data()) + ip_header_len;
+        size_t total_icmp_len = recv_len - ip_header_len;
         cout << "res total_icmp_len: " << total_icmp_len << endl;
 
-        ICMPhdr l_icmp;
-        size_t copy_len = min(sizeof(ICMPhdr), total_icmp_len);
-        memset(&l_icmp, 0, sizeof(l_icmp));
-        memcpy(&l_icmp, icmp_start, copy_len);
-        uint8_t type = l_icmp.type;
-        uint8_t code = l_icmp.code;
+        ICMPhdr* l_icmp = reinterpret_cast<ICMPhdr*>(icmp_start);
+        uint8_t type = l_icmp->type;
+        uint8_t code = l_icmp->code;
 
         cout << "External ICMP type=" << int(type) << " code=" << int(code) << " from " << inet_ntoa(sender_addr.sin_addr) << endl;
 
         bool matched_any = false;
 
-        if (type == 0) {
-            uint16_t r_id = ntohs(l_icmp.identifier);
-            uint16_t r_seq = ntohs(l_icmp.sequence);
+        if (type == 0 && code == 0) { //это эхо ответ
+            uint16_t r_id = ntohs(l_icmp->identifier);
+            uint16_t r_seq = ntohs(l_icmp->sequence);
 
-            size_t data_off = offsetof(ICMPhdr, data);
-            if (total_icmp_len >= data_off + GUID_LEN) {
-                const uint8_t* payload_guid = icmp_start + data_off;
+            if (total_icmp_len >= ICMP_HDR_MIN + GUID_LEN) { //длина icmp пакета валидна
+                uint8_t* payload_guid = icmp_start + ICMP_HDR_MIN; //указатель на начало полезной нагрузки icmp
+                size_t payload_len = total_icmp_len - ICMP_HDR_MIN;
                 for (auto &pkt : packets) {
-                    if (pkt.status == PacketStatus::SENT && pkt.id == (int)r_seq) {
-                        if (memcmp(pkt.guid, payload_guid, GUID_LEN) == 0 && (int)r_id == (GetCurrentProcessId() & 0xFFFF)) {
-                            pkt.status = PacketStatus::RESP_RECVD;
-                            pkt.receive_timestamp = chrono::steady_clock::now();
-                            matched_any = true;
-                            break;
+                    if (pkt.status == PacketStatus::SENT && equal(begin(pkt.guid), end(pkt.guid), payload_guid ) && pkt.id == (int)r_seq) { //пакет отправлен и guid совпал
+                        cout << "  [RECVD]: ";
+                        if (payload_len >= GUID_LEN) {
+                        for (int i = 0; i < GUID_LEN; ++i)
+                            printf("%02X ", payload_guid[i]);
+                        } else {
                         }
+                        cout << endl;
+                        cout << "  [EXPECT]: ";
+                        for (int i = 0; i < GUID_LEN; ++i) printf("%02X ", (uint8_t)pkt.guid[i]);
+                        cout << endl;
+                        pkt.status = PacketStatus::RESP_RECVD;
+                        pkt.receive_timestamp = chrono::steady_clock::now();
+                        matched_any = true;
+                        break;
                     }
                 }
             } else {
                 // недостаточно данных
             }
-        } else if (is_error(static_cast<TypeRequest>(type))) {
-            const uint8_t* outer_payload = icmp_start + offsetof(ICMPhdr, data);
-            size_t outer_payload_len = (total_icmp_len > offsetof(ICMPhdr, data)) ? (total_icmp_len - offsetof(ICMPhdr, data)) : 0;        if (outer_payload_len >= IP_HDR_MIN + ICMP_HDR_MIN) {
-                // внутренний IP
-                const uint8_t* inner_ip = outer_payload;
-                size_t inner_ip_hlen = (static_cast<size_t>(inner_ip[0]) & 0x0F) * 4;
-                if (inner_ip_hlen < IP_HDR_MIN) continue;
+        } else if (is_error(static_cast<TypeRequest>(type))) { //это ответ с ошибкой
+            uint8_t* outer_payload = icmp_start + sizeof(ICMPhdr);
+            size_t outer_payload_len = total_icmp_len - sizeof(ICMPhdr);
 
+            if (outer_payload_len >= IP_HDR_MIN + ICMP_HDR_MIN) { //длина внутреннего IP пакета валидна по отношению к минимальной длине
+                // внутренний IP
+                uint8_t* inner_ip = outer_payload;
+                size_t inner_ip_hlen = (static_cast<size_t>(inner_ip[0]) & 0x0F) * 4;
+
+                if (inner_ip_hlen < IP_HDR_MIN) continue; //длина внутреннего IP заголовка валидна
                 if (outer_payload_len < inner_ip_hlen + ICMP_HDR_MIN) continue;
 
-                const uint8_t* inner_icmp = inner_ip + inner_ip_hlen;
+                uint8_t* inner_icmp = inner_ip + inner_ip_hlen;
                 size_t inner_icmp_len = outer_payload_len - inner_ip_hlen;
-
-                ICMPhdr inner;
-                memset(&inner, 0, sizeof(inner));
-                size_t to_copy_inner = min(sizeof(inner), inner_icmp_len);
-                memcpy(&inner, inner_icmp, to_copy_inner);
-
-                uint16_t inner_seq = ntohs(inner.sequence);
-                uint16_t inner_id = ntohs(inner.identifier);
-
-                size_t inner_data_off = offsetof(ICMPhdr, data);
+                ICMPhdr* inner = (ICMPhdr*) inner_icmp;
+                uint16_t inner_seq = ntohs(inner->sequence);
+                size_t inner_data_off = sizeof(ICMPhdr);
                 if (inner_icmp_len >= inner_data_off + GUID_LEN) {
-                    const uint8_t* inner_guid = inner_icmp + inner_data_off;
-                    // Ищем пакет с таким seq и guid
+                    uint8_t* inner_guid = inner_icmp + inner_data_off;
                     for (auto &pkt : packets) {
-                        if (pkt.status == PacketStatus::SENT && pkt.id == (int)inner_seq) {
-                            if (memcmp(pkt.guid, inner_guid, GUID_LEN) == 0 && (int)inner_id == (GetCurrentProcessId() & 0xFFFF)) {
-                                pkt.status = PacketStatus::RESP_ERROR; // это ошибка (destination unreachable / ttl exceeded)
-                                pkt.receive_timestamp = chrono::steady_clock::now();
-                                auto p = status_of_err(static_cast<TypeRequest>(type), static_cast<TypeCodes>(code));
-                                cout << "ICMP Error for seq=" << inner_seq << ": " << p.second << endl;
-                                matched_any = true;
-                                break;
-                            }
+                        if (pkt.status == PacketStatus::SENT && equal(begin(pkt.guid), end(pkt.guid), inner_guid)) {
+                            pkt.status = PacketStatus::RESP_ERROR; // это ошибка (destination unreachable / ttl exceeded)
+                            pkt.receive_timestamp = chrono::steady_clock::now();
+                            auto p = status_of_err(static_cast<TypeRequest>(type), static_cast<TypeCodes>(code));
+                            cout << "ICMP Error for seq=" << inner_seq << ": " << p.second << endl;
+                            matched_any = true;
+                            break;
                         }
                     }
                 } else {
@@ -509,10 +499,11 @@ void read_socket(SOCKET &s,
     }
 }
 
-int main()
+int main(int argc, char* argv[])
 {
     SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);if (init_socket(sock) != 0) {
+    SetConsoleCP(CP_UTF8);
+    if (init_socket(sock) != 0) {
         cerr << "socket init failed\n";
         return 1;
     }
@@ -520,7 +511,11 @@ int main()
     struct sockaddr_in dest_addr;
     memset(&dest_addr, 0, sizeof(dest_addr));
     dest_addr.sin_family = AF_INET;
-    dest_addr.sin_addr.s_addr = inet_addr(sin_addr);
+    if (argc > 1) {
+        dest_addr.sin_addr.s_addr = inet_addr(argv[1]);
+    } else {
+        dest_addr.sin_addr.s_addr = inet_addr(sin_addr);
+    }
 
     fd_set readfs;
 
@@ -539,7 +534,7 @@ int main()
         check_timeout(packets, RESPONSE_TIMEOUT_MS);
 
         if (currPacket > countPacket - 1 && all_responses_received) {
-            cout << "Все пакеты отправлены." << endl;
+            cout << "All packages have been sent." << endl;
             break;
         }
 
@@ -554,7 +549,7 @@ int main()
         }
         if (FD_ISSET(sock, &readfs)) {
             cout << "socket is ready!" << endl;
-            read_socket(sock, recvBuffer, packets, currPacket);
+            read_socket(sock, recvBuffer, packets);
         } else {
             //cout << "socket is not ready!" << endl;
         }
