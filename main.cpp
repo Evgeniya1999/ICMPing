@@ -26,6 +26,7 @@ const char* sin_addr = "8.8.8.8";
 
 constexpr size_t ICMP_HDR_MIN = 8;
 constexpr size_t IP_HDR_MIN = 20;
+constexpr size_t IP_HDR_MAX = 60;
 
 const int GUID_LEN = 16;
 
@@ -194,7 +195,10 @@ vector<char> packetForm(int currP){
         cerr << "CoCreateGuid failed" << std::endl;
         return {};
     }
-    memcpy(icmphdr.data, &guid, sizeof(guid));
+    const uint8_t* start = reinterpret_cast<const uint8_t*>(&guid);
+    const uint8_t* end   = start + sizeof(guid);
+    copy(start, end, begin(icmphdr.data));
+    //memcpy(icmphdr.data, &guid, sizeof(guid));
 
     icmphdr.type = 8;
     icmphdr.code = 0;
@@ -209,8 +213,10 @@ vector<char> packetForm(int currP){
     cout << "total_size: " << total_size << endl;
 
     vector<char> sendBuffer(sizeof(ICMPhdr));
-    memcpy(sendBuffer.data(), &icmphdr, sizeof(ICMPhdr));
-
+    const char* icmphdr_start = reinterpret_cast<const char*>(&icmphdr);
+    const char* icmphdr_end   = icmphdr_start + sizeof(ICMPhdr);
+    copy(icmphdr_start, icmphdr_end, begin(sendBuffer));
+    //memcpy(sendBuffer.data(), &icmphdr, sizeof(ICMPhdr));
 
     cout << "\n=== ICMP Packet #" << currP << " ===\n";
     cout << "type=" << dec << (int)icmphdr.type
@@ -328,13 +334,13 @@ bool send_packets(SOCKET &s,
             packetData.status = PacketStatus::SENT;
             packetData.send_timestamp = chrono::steady_clock::now();
 
-            size_t data_off = offsetof(ICMPhdr, data);
-            if (sendBuffer.size() >= data_off + GUID_LEN) {
-                memcpy(packetData.guid, sendBuffer.data() + data_off, sizeof(packetData.guid));
+            const ICMPhdr* icmp = reinterpret_cast<const ICMPhdr*>(sendBuffer.data());
+            if (sendBuffer.size() >= ICMP_HDR_MIN + GUID_LEN) {
+                copy(begin(icmp->data), end(icmp->data), begin(packetData.guid));
                 cout << "packetData.guid: " ;
                 print_data_cout(packetData.guid);
             } else {
-                memset(packetData.guid, 0, sizeof(packetData.guid));
+                fill(begin(packetData.guid), end(packetData.guid), 0);
             }
 
             cout << "send Hex: ";
@@ -391,16 +397,17 @@ void read_socket(SOCKET &s,
                 break;
             }
         }
-        if (recv_len < (int)sizeof(IPHdr)) continue; //длина валидна
-
+        if (recv_len < static_cast<int>(IP_HDR_MIN)) continue; //длина валидна
         cout << "Get raw packet size=" << recv_len << endl;
+        uint8_t ihl = recvBuffer[0] & 0x0F;
+        size_t ip_header_len = ihl * 4;
+
+        if (ip_header_len < IP_HDR_MIN || ip_header_len > IP_HDR_MAX) {continue;}
+        if (static_cast<size_t>(recv_len) < ip_header_len + ICMP_HDR_MIN) {continue;}
 
         IPHdr* ip = reinterpret_cast<IPHdr*>(recvBuffer.data());
-        if (ip->ip_p != IPPROTO_ICMP) {continue;}// не ICMP
 
-        size_t ip_header_len = (static_cast<uint8_t>(recvBuffer[0]) & 0x0F) * 4;
-        if (ip_header_len < IP_HDR_MIN || //миним длина IP заголовка
-            static_cast<size_t>(recv_len) < ip_header_len + ICMP_HDR_MIN) {continue;} // IP заголовок не валиден
+        if (ip->ip_p != IPPROTO_ICMP) continue;
 
         uint8_t* icmp_start = reinterpret_cast<uint8_t*>(recvBuffer.data()) + ip_header_len;
         size_t total_icmp_len = recv_len - ip_header_len;
@@ -446,44 +453,41 @@ void read_socket(SOCKET &s,
             uint8_t* outer_payload = icmp_start + sizeof(ICMPhdr);
             size_t outer_payload_len = total_icmp_len - sizeof(ICMPhdr);
 
-            if (outer_payload_len >= IP_HDR_MIN + ICMP_HDR_MIN) { //длина внутреннего IP пакета валидна по отношению к минимальной длине
-                // внутренний IP
-                uint8_t* inner_ip = outer_payload;
-                size_t inner_ip_hlen = (static_cast<size_t>(inner_ip[0]) & 0x0F) * 4;
+            if (outer_payload_len < IP_HDR_MIN + ICMP_HDR_MIN) continue; //длина внутреннего IP пакета валидна по отношению к минимальной длине
+            // внутренний IP
+            uint8_t* inner_ip = outer_payload;
+            size_t inner_ip_hlen = (static_cast<size_t>(inner_ip[0]) & 0x0F) * 4;
 
-                if (inner_ip_hlen < IP_HDR_MIN) continue; //длина внутреннего IP заголовка валидна
-                if (outer_payload_len < inner_ip_hlen + ICMP_HDR_MIN) continue;
+            if (inner_ip_hlen < IP_HDR_MIN || inner_ip_hlen > IP_HDR_MAX) continue; //длина внутреннего IP заголовка валидна
+            if (outer_payload_len < inner_ip_hlen + ICMP_HDR_MIN) continue;
 
-                uint8_t* inner_icmp = inner_ip + inner_ip_hlen;
-                size_t inner_icmp_len = outer_payload_len - inner_ip_hlen;
-                ICMPhdr* inner = (ICMPhdr*) inner_icmp;
-                uint16_t inner_seq = ntohs(inner->sequence);
-                size_t inner_data_off = sizeof(ICMPhdr);
-                if (inner_icmp_len >= inner_data_off + GUID_LEN) {
-                    uint8_t* inner_guid = inner_icmp + inner_data_off;
-                    for (auto &pkt : packets) {
-                        if (pkt.status == PacketStatus::SENT && equal(begin(pkt.guid), end(pkt.guid), inner_guid)) {
-                            pkt.status = PacketStatus::RESP_ERROR; // это ошибка (destination unreachable / ttl exceeded)
-                            pkt.receive_timestamp = chrono::steady_clock::now();
-                            auto p = status_of_err(static_cast<TypeRequest>(type), static_cast<TypeCodes>(code));
-                            cout << "ICMP Error for seq=" << inner_seq << ": " << p.second << endl;
-                            matched_any = true;
-                            break;
-                        }
-                    }
-                } else {
-                    // недостаточно данных во вложенном ICMP, но можно проверить seq/id если доступны
-                    for (auto &pkt : packets) {
-                        if (pkt.status == PacketStatus::SENT && pkt.id == (int)inner_seq) {
-                            pkt.status = PacketStatus::RESP_ERROR;
-                            pkt.receive_timestamp = chrono::steady_clock::now();
-                            matched_any = true;
-                            break;
-                        }
+            uint8_t* inner_icmp = inner_ip + inner_ip_hlen;
+            size_t inner_icmp_len = outer_payload_len - inner_ip_hlen;
+            ICMPhdr* inner = (ICMPhdr*) inner_icmp;
+            uint16_t inner_seq = ntohs(inner->sequence);
+            size_t inner_data_off = sizeof(ICMPhdr);
+            if (inner_icmp_len >= inner_data_off + GUID_LEN) {
+                uint8_t* inner_guid = inner_icmp + inner_data_off;
+                for (auto &pkt : packets) {
+                    if (pkt.status == PacketStatus::SENT && equal(begin(pkt.guid), end(pkt.guid), inner_guid)) {
+                        pkt.status = PacketStatus::RESP_ERROR; // это ошибка (destination unreachable / ttl exceeded)
+                        pkt.receive_timestamp = chrono::steady_clock::now();
+                        auto p = status_of_err(static_cast<TypeRequest>(type), static_cast<TypeCodes>(code));
+                        cout << "ICMP Error for seq=" << inner_seq << ": " << p.second << endl;
+                        matched_any = true;
+                        break;
                     }
                 }
             } else {
-                // payload слишком мал
+                // недостаточно данных во вложенном ICMP, но можно проверить seq/id если доступны
+                for (auto &pkt : packets) {
+                    if (pkt.status == PacketStatus::SENT && pkt.id == (int)inner_seq) {
+                        pkt.status = PacketStatus::RESP_ERROR;
+                        pkt.receive_timestamp = chrono::steady_clock::now();
+                        matched_any = true;
+                        break;
+                    }
+                }
             }
         } else {
             cout << "Unhandled ICMP type: " << int(type) << endl;
@@ -508,8 +512,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
+    struct sockaddr_in dest_addr {};
     dest_addr.sin_family = AF_INET;
     if (argc > 1) {
         dest_addr.sin_addr.s_addr = inet_addr(argv[1]);
@@ -519,7 +522,7 @@ int main(int argc, char* argv[])
 
     fd_set readfs;
 
-    vector<char> recvBuffer(4096);
+    vector<char> recvBuffer(1500);//предел размера пакета для ethernet без фрагментации
     vector<char> sendBuffer;
     vector<PacketData> packets;
     auto next_send = chrono::steady_clock::now();
