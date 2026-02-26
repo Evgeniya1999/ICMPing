@@ -111,7 +111,7 @@ pair <TypeRequest, string> status_of_err(TypeRequest type, TypeCodes code) {
     }
     case TypeRequest::TYPE5: {
         switch (code){
-    case TypeCodes::CODE0:  return make_pair(TypeRequest::TYPE5, "Redirect. Redirect for the network.");case TypeCodes::CODE1:  return make_pair(TypeRequest::TYPE5, "Redirect. Redirect for the host.");
+        case TypeCodes::CODE0:  return make_pair(TypeRequest::TYPE5, "Redirect. Redirect for the network.");case TypeCodes::CODE1:  return make_pair(TypeRequest::TYPE5, "Redirect. Redirect for the host.");
         default: return make_pair(TypeRequest::TYPE5, "UNKNOWN CODE for TYPE5");}
     }
     default:
@@ -133,15 +133,12 @@ uint16_t icmp_checksum(const void *data, size_t len) {
         bytes += 2;
         len -= 2;
     }
-
     if (len) {
         sum += static_cast<uint16_t>(bytes[0]) << 8;
     }
-
     // fold 32-bit sum to 16 bits
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
-
     return static_cast<uint16_t>(~sum);
 }
 void print_hex(const char* data, int len, int countBytes)
@@ -163,7 +160,6 @@ void print_bytes_hex(const uint8_t* data, size_t len) {
     }
     ios oldState(nullptr);
     oldState.copyfmt(cout);
-
     for (size_t i = 0; i < len; ++i) {
         unsigned int b = static_cast<unsigned char>(data[i]);
         cout << hex << uppercase << setw(2) << setfill('0') << b;
@@ -188,52 +184,32 @@ void print_data_cout(const uint8_t data[16]) {
     }
     print_bytes_hex(data, 16);
 }
-
-vector<char> packetForm(int currP){
-    ICMPhdr icmphdr;
-    GUID guid;
-    HRESULT hr = CoCreateGuid(&guid);
+vector<char> packetForm(int currP) {
+    vector<char> sendBuffer(sizeof(ICMPhdr));
+    ICMPhdr* icmphdr = reinterpret_cast<ICMPhdr*>(sendBuffer.data());
+    HRESULT hr = CoCreateGuid(reinterpret_cast<GUID*>(icmphdr->data));
     if (FAILED(hr)) {
-        cerr << "CoCreateGuid failed" <<
-            endl;
+        cerr << "CoCreateGuid failed" << endl;
         return {};
     }
-    const uint8_t* start = reinterpret_cast<const uint8_t*>(&guid);
-    const uint8_t* end   = start + sizeof(guid);
-    copy(start, end, begin(icmphdr.data));
-
-    icmphdr.type = 8;
-    icmphdr.code = 0;
-    icmphdr.identifier = htons(static_cast<uint16_t>(GetCurrentProcessId() & 0xFFFF));
-    icmphdr.sequence = htons(static_cast<uint16_t>(currP));
-    icmphdr.checksum = 0;
-    icmphdr.checksum = htons(icmp_checksum(&icmphdr, sizeof(ICMPhdr)));
-
-    const size_t header_size = sizeof(icmphdr.type) + sizeof(icmphdr.code) + sizeof(icmphdr.checksum);
-    const size_t payload_size = sizeof(icmphdr.data);
-    //const size_t total_size = header_size + payload_size;
-
-    vector<char> sendBuffer(sizeof(ICMPhdr));
-    const char* icmphdr_start = reinterpret_cast<const char*>(&icmphdr);
-    const char* icmphdr_end   = icmphdr_start + sizeof(ICMPhdr);
-    copy(icmphdr_start, icmphdr_end, begin(sendBuffer));
-
+    icmphdr->type = 8;
+    icmphdr->code = 0;
+    icmphdr->identifier = htons(static_cast<uint16_t>(GetCurrentProcessId() & 0xFFFF));
+    icmphdr->sequence = htons(static_cast<uint16_t>(currP));
+    icmphdr->checksum = 0;
+    icmphdr->checksum = htons(icmp_checksum(icmphdr, sizeof(ICMPhdr)));
     cout << "\n=== ICMP Packet #" << currP << " ===\n";
-    cout << "type=" << dec << (int)icmphdr.type
-         << " code=" << (int)icmphdr.code
-         << " id=" << ntohs(icmphdr.identifier)
-         << " seq=" << ntohs(icmphdr.sequence) << endl;
-    printf("checksum=0x%04X\n", ntohs(icmphdr.checksum));
+    cout << "type=" << (int)icmphdr->type << " code=" << (int)icmphdr->code
+         << " id=" << ntohs(icmphdr->identifier)
+         << " seq=" << ntohs(icmphdr->sequence) << endl;
+    printf("checksum=0x%04X\n", ntohs(icmphdr->checksum));
 
     cout << "payload (GUID) = ";
-    print_data_cout(icmphdr.data);
-    //cout << "sizeof(ICMPhdr) = " << sizeof(ICMPhdr) << " bytes\n";
+    print_data_cout(icmphdr->data);
     cout << "--------------------------\n";
 
     return sendBuffer;
 }
-
-
 string status_to_string(PacketStatus s) {
     switch (s) {
     case PacketStatus::NSEND:      return "NSEND";
@@ -268,7 +244,6 @@ int init_socket(SOCKET &s){
         cerr << "WSAStartup failed with error: " << error_code << endl;
         return -1;
     }
-
     if (LOBYTE(wsaData.wVersion) != 2 || HIBYTE(wsaData.wVersion) != 2) {
         cout << "Could not find a usable version of Winsock.dll" << endl;
         WSACleanup();
@@ -276,7 +251,6 @@ int init_socket(SOCKET &s){
     } else {
         cout << "The Winsock 2.2 dll was found okay\n" << endl;
     }
-
     s = WSASocket(AF_INET, SOCK_RAW, IPPROTO_ICMP, 0, 0, 0);
     if (s == INVALID_SOCKET) {
         int error_code = WSAGetLastError();
@@ -284,7 +258,6 @@ int init_socket(SOCKET &s){
         WSACleanup();
         return -1;
     }
-
     DWORD nonBlocking = 1;
     if ( ioctlsocket( s, FIONBIO, &nonBlocking ) != 0 ) {
         int error_code = WSAGetLastError();
@@ -293,7 +266,6 @@ int init_socket(SOCKET &s){
         WSACleanup();
         return -1;
     }
-
     int ttl_value = 110;
     if ( setsockopt( s, IPPROTO_IP, IP_TTL, (const char*)&ttl_value,  sizeof(ttl_value)) != 0 ) {
         int error_code = WSAGetLastError();
@@ -328,29 +300,28 @@ bool send_packets(SOCKET &s,
             int error_code = WSAGetLastError();
             cerr << "sendto failed with error: " << error_code << endl;
             return true;
-        } else {
-            PacketData packetData{};
-            packetData.id = currPacket;
-            packetData.status = PacketStatus::SENT;
-            packetData.send_timestamp = chrono::steady_clock::now();
-
-            const ICMPhdr* icmp = reinterpret_cast<const ICMPhdr*>(sendBuffer.data());
-            if (sendBuffer.size() >= ICMP_HDR_MIN + GUID_LEN) {
-                copy(begin(icmp->data), end(icmp->data), begin(packetData.guid));
-                cout << "packetData.guid: " ;
-                print_data_cout(packetData.guid);
-            } else {
-                fill(begin(packetData.guid), end(packetData.guid), 0);
-            }
-
-            if (sent_bytes > 0 && static_cast<size_t>(sent_bytes) <= sendBuffer.size()) {
-                print_hex(sendBuffer.data(), static_cast<int>(sendBuffer.size()), sent_bytes);
-            }
-
-            packets.push_back(packetData);
-            ++currPacket;
-            next_send = now + chrono::milliseconds(SEND_INTERVAL_MS);
         }
+        packets.emplace_back();
+        PacketData& packet_data = packets.back();
+
+        packet_data.id = currPacket;
+        packet_data.status = PacketStatus::SENT;
+        packet_data.send_timestamp = chrono::steady_clock::now();
+
+        const ICMPhdr* icmp = reinterpret_cast<const ICMPhdr*>(sendBuffer.data());
+        if (sendBuffer.size() >= ICMP_HDR_MIN + GUID_LEN) {
+            copy(begin(icmp->data), end(icmp->data), begin(packet_data.guid));
+            cout << "packet_data.guid: " ;
+            print_data_cout(packet_data.guid);
+        } else {
+            fill(begin(packet_data.guid), end(packet_data.guid), 0);
+        }
+
+        if (sent_bytes > 0 && static_cast<size_t>(sent_bytes) <= sendBuffer.size()) {
+            print_hex(sendBuffer.data(), static_cast<int>(sendBuffer.size()), sent_bytes);
+        }
+        ++currPacket;
+        next_send = now + chrono::milliseconds(SEND_INTERVAL_MS);
     }
     return false;
 }
